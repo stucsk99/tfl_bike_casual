@@ -35,38 +35,6 @@ def _norm_colname(s: str) -> str:
     return "".join(ch for ch in s.lower() if ch.isalnum())
 
 
-# Normalised candidate sets (schema varies across TfL extracts)
-START_ID_NORMS = [
-    "startstationid",
-    "startstationlogicalterminal",
-    "startstationnumber",
-]
-START_DATE_NORMS = [
-    "startdate",
-    "startdatetime",
-    "starttime",
-]
-
-END_ID_NORMS = [
-    "endstationid",
-    "endstationlogicalterminal",
-    "endstationnumber",
-]
-END_DATE_NORMS = [
-    "enddate",
-    "enddatetime",
-    "endtime",
-]
-
-
-def _pick_col(cols: list[str], candidate_norms: list[str]) -> Optional[str]:
-    """Pick the first column whose normalised form matches one of the candidates."""
-    norm_to_real = {_norm_colname(c): c for c in cols}
-    for cn in candidate_norms:
-        if cn in norm_to_real:
-            return norm_to_real[cn]
-    return None
-
 
 def aggregate_from_folder_chunked(
     folder_path: str | Path,
@@ -200,6 +168,105 @@ def aggregate_from_folder_chunked(
             print(f"  ... and {len(skipped) - 20} more")
 
     return acc
+
+
+
+
+def _norm(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+def _pick_col(cols, candidates_norm):
+    norm_map = {_norm(c): c for c in cols}
+    for cn in candidates_norm:
+        if cn in norm_map:
+            return norm_map[cn]
+    return None
+
+START_ID = ["startstationid", "startstationlogicalterminal", "startstationnumber"]
+START_DT = ["startdate", "startdatetime", "starttime"]
+END_ID   = ["endstationid", "endstationlogicalterminal", "endstationnumber"]
+END_DT   = ["enddate", "enddatetime", "endtime"]
+
+def aggregate_one_csv_to_parquet(
+    csv_path: str | Path,
+    out_dir: str | Path,
+    *,
+    freq: str = "h",
+    side: str = "start",
+    chunksize: int = 120_000,
+    dayfirst: bool = True,
+) -> Path | None:
+    csv_path = Path(csv_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    header = pd.read_csv(csv_path, nrows=0)
+    cols = list(header.columns)
+
+    start_id = _pick_col(cols, START_ID)
+    start_dt = _pick_col(cols, START_DT)
+    end_id   = _pick_col(cols, END_ID)
+    end_dt   = _pick_col(cols, END_DT)
+
+    usecols = []
+    if side in ("start", "both"):
+        if start_id is None or start_dt is None:
+            return None
+        usecols += [start_id, start_dt]
+    if side in ("end", "both"):
+        if end_id is None or end_dt is None:
+            return None
+        usecols += [end_id, end_dt]
+    usecols = list(dict.fromkeys(usecols))
+
+    # Aggregate in-memory for THIS ONE FILE only (safe)
+    agg_list = []
+
+    for chunk in pd.read_csv(csv_path, usecols=usecols, chunksize=chunksize, low_memory=True):
+        parts = []
+
+        if side in ("start", "both"):
+            tmp = chunk[[start_id, start_dt]].dropna()
+            tmp["station_id"] = pd.to_numeric(tmp[start_id], errors="coerce")
+            tmp["ts"] = pd.to_datetime(tmp[start_dt], dayfirst=dayfirst, errors="coerce")
+            tmp = tmp.dropna(subset=["station_id", "ts"])
+            tmp["station_id"] = tmp["station_id"].astype("int32")
+            tmp["ts"] = tmp["ts"].dt.floor(freq)
+            g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_start"})
+            parts.append(g)
+
+        if side in ("end", "both"):
+            tmp = chunk[[end_id, end_dt]].dropna()
+            tmp["station_id"] = pd.to_numeric(tmp[end_id], errors="coerce")
+            tmp["ts"] = pd.to_datetime(tmp[end_dt], dayfirst=dayfirst, errors="coerce")
+            tmp = tmp.dropna(subset=["station_id", "ts"])
+            tmp["station_id"] = tmp["station_id"].astype("int32")
+            tmp["ts"] = tmp["ts"].dt.floor(freq)
+            g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_end"})
+            parts.append(g)
+
+        if not parts:
+            continue
+
+        chunk_agg = parts[0]
+        for p in parts[1:]:
+            chunk_agg = chunk_agg.merge(p, on=["station_id", "ts"], how="outer")
+
+        agg_list.append(chunk_agg)
+
+    if not agg_list:
+        return None
+
+    file_agg = pd.concat(agg_list, ignore_index=True)
+    sum_cols = [c for c in ["trips_start", "trips_end"] if c in file_agg.columns]
+    file_agg = file_agg.groupby(["station_id", "ts"], as_index=False)[sum_cols].sum()
+
+    for c in sum_cols:
+        file_agg[c] = file_agg[c].fillna(0).astype("int32")
+
+    out_path = out_dir / f"{csv_path.stem}.parquet"
+    file_agg.to_parquet(out_path, index=False)
+    return out_path
 
 
 # -----------------------------
