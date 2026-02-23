@@ -269,6 +269,135 @@ def aggregate_one_csv_to_parquet(
     return out_path
 
 
+def _looks_like_text_csv(path: Path, nbytes: int = 2048) -> bool:
+    """
+    Returns True if the file begins with printable text and contains commas/newlines,
+    which strongly suggests it's CSV/TSV-like, even if the extension is .xls.
+    """
+    with open(path, "rb") as f:
+        head = f.read(nbytes)
+
+    # If it contains a lot of null bytes, it's probably binary (real .xls)
+    if b"\x00" in head:
+        return False
+
+    # Try decoding as UTF-8 or latin-1; if that works and we see commas, likely CSV
+    try:
+        text = head.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = head.decode("latin-1")
+        except UnicodeDecodeError:
+            return False
+
+    return ("," in text) and ("\n" in text or "\r" in text)
+
+
+
+def aggregate_one_file_to_parquet(
+    path: str | Path,
+    out_dir: str | Path,
+    *,
+    freq: str = "h",
+    side: str = "start",
+    chunksize: int = 120_000,
+    dayfirst: bool = True,
+    sheet_name: int | str = 0,
+) -> Path | None:
+    path = Path(path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = path.suffix.lower()
+
+    # Decide how to read
+    treat_as_csv = (ext == ".csv") or (ext == ".xls" and _looks_like_text_csv(path))
+
+    # --- header + cols ---
+    if treat_as_csv:
+        header = pd.read_csv(path, nrows=0)
+        cols = list(header.columns)
+    elif ext == ".xls":
+        header = pd.read_excel(path, sheet_name=sheet_name, nrows=0, engine="xlrd")
+        cols = list(header.columns)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+    start_id = _pick_col(cols, START_ID)
+    start_dt = _pick_col(cols, START_DT)
+    end_id   = _pick_col(cols, END_ID)
+    end_dt   = _pick_col(cols, END_DT)
+
+    usecols = []
+    if side in ("start", "both"):
+        if start_id is None or start_dt is None:
+            return None
+        usecols += [start_id, start_dt]
+    if side in ("end", "both"):
+        if end_id is None or end_dt is None:
+            return None
+        usecols += [end_id, end_dt]
+    usecols = list(dict.fromkeys(usecols))
+
+    def agg_df(df: pd.DataFrame) -> pd.DataFrame:
+        parts = []
+
+        if side in ("start", "both"):
+            tmp = df[[start_id, start_dt]].dropna()
+            tmp["station_id"] = pd.to_numeric(tmp[start_id], errors="coerce")
+            tmp["ts"] = pd.to_datetime(tmp[start_dt], dayfirst=dayfirst, errors="coerce")
+            tmp = tmp.dropna(subset=["station_id", "ts"])
+            tmp["station_id"] = tmp["station_id"].astype("int32")
+            tmp["ts"] = tmp["ts"].dt.floor(freq)
+            g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_start"})
+            parts.append(g)
+
+        if side in ("end", "both"):
+            tmp = df[[end_id, end_dt]].dropna()
+            tmp["station_id"] = pd.to_numeric(tmp[end_id], errors="coerce")
+            tmp["ts"] = pd.to_datetime(tmp[end_dt], dayfirst=dayfirst, errors="coerce")
+            tmp = tmp.dropna(subset=["station_id", "ts"])
+            tmp["station_id"] = tmp["station_id"].astype("int32")
+            tmp["ts"] = tmp["ts"].dt.floor(freq)
+            g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_end"})
+            parts.append(g)
+
+        if not parts:
+            return pd.DataFrame(columns=["station_id", "ts"])
+
+        out = parts[0]
+        for p in parts[1:]:
+            out = out.merge(p, on=["station_id", "ts"], how="outer")
+        return out
+
+    agg_list = []
+
+    if treat_as_csv:
+        for chunk in pd.read_csv(path, usecols=usecols, chunksize=chunksize, low_memory=True):
+            chunk_agg = agg_df(chunk)
+            if len(chunk_agg):
+                agg_list.append(chunk_agg)
+    else:
+        df = pd.read_excel(path, sheet_name=sheet_name, usecols=usecols, engine="xlrd")
+        file_agg = agg_df(df)
+        if len(file_agg):
+            agg_list.append(file_agg)
+
+    if not agg_list:
+        return None
+
+    file_agg = pd.concat(agg_list, ignore_index=True)
+    sum_cols = [c for c in ["trips_start", "trips_end"] if c in file_agg.columns]
+    file_agg = file_agg.groupby(["station_id", "ts"], as_index=False)[sum_cols].sum()
+
+    for c in sum_cols:
+        file_agg[c] = file_agg[c].fillna(0).astype("int32")
+
+    out_path = out_dir / f"{path.stem}.parquet"
+    file_agg.to_parquet(out_path, index=False)
+    return out_path
+
+
 # -----------------------------
 # Bike station locations
 # -----------------------------
