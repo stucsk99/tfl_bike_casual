@@ -15,6 +15,7 @@ These utilities are intentionally "boring": pure functions + explicit inputs/out
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.resources import path
 from pathlib import Path
 from typing import Iterable, Literal, Optional
 
@@ -182,10 +183,22 @@ def _pick_col(cols, candidates_norm):
             return norm_map[cn]
     return None
 
-START_ID = ["startstationid", "startstationlogicalterminal", "startstationnumber"]
+#START_ID = ["startstationid", "startstationlogicalterminal", "startstationnumber"]
 START_DT = ["startdate", "startdatetime", "starttime"]
-END_ID   = ["endstationid", "endstationlogicalterminal", "endstationnumber"]
+#END_ID   = ["endstationid", "endstationlogicalterminal", "endstationnumber"]
 END_DT   = ["enddate", "enddatetime", "endtime"]
+START_ID = [
+    "startstationid",                 # BikePoint-ish
+    "start station id",
+    "startstationnumber",
+    "startstationlogicalterminal",    # fallback only
+]
+END_ID = [
+    "endstationid",
+    "end station id",
+    "endstationnumber",
+    "endstationlogicalterminal",
+]
 
 def aggregate_one_csv_to_parquet(
     csv_path: str | Path,
@@ -208,6 +221,9 @@ def aggregate_one_csv_to_parquet(
     end_id   = _pick_col(cols, END_ID)
     end_dt   = _pick_col(cols, END_DT)
 
+    if "logicalterminal" in str(start_id).lower():
+        print(f"  [warn] {path.name}: using logical terminal IDs for start stations")
+
     usecols = []
     if side in ("start", "both"):
         if start_id is None or start_dt is None:
@@ -228,6 +244,7 @@ def aggregate_one_csv_to_parquet(
         if side in ("start", "both"):
             tmp = chunk[[start_id, start_dt]].dropna()
             tmp["station_id"] = pd.to_numeric(tmp[start_id], errors="coerce")
+            tmp = tmp[tmp["station_id"] <= max_station_id]
             tmp["ts"] = pd.to_datetime(tmp[start_dt], dayfirst=dayfirst, errors="coerce")
             tmp = tmp.dropna(subset=["station_id", "ts"])
             tmp["station_id"] = tmp["station_id"].astype("int32")
@@ -238,6 +255,7 @@ def aggregate_one_csv_to_parquet(
         if side in ("end", "both"):
             tmp = chunk[[end_id, end_dt]].dropna()
             tmp["station_id"] = pd.to_numeric(tmp[end_id], errors="coerce")
+            tmp = tmp[tmp["station_id"] <= max_station_id]
             tmp["ts"] = pd.to_datetime(tmp[end_dt], dayfirst=dayfirst, errors="coerce")
             tmp = tmp.dropna(subset=["station_id", "ts"])
             tmp["station_id"] = tmp["station_id"].astype("int32")
@@ -303,6 +321,7 @@ def aggregate_one_file_to_parquet(
     chunksize: int = 120_000,
     dayfirst: bool = True,
     sheet_name: int | str = 0,
+    max_station_id: int | None = 5000,
 ) -> Path | None:
     path = Path(path)
     out_dir = Path(out_dir)
@@ -347,6 +366,11 @@ def aggregate_one_file_to_parquet(
             tmp["station_id"] = pd.to_numeric(tmp[start_id], errors="coerce")
             tmp["ts"] = pd.to_datetime(tmp[start_dt], dayfirst=dayfirst, errors="coerce")
             tmp = tmp.dropna(subset=["station_id", "ts"])
+
+            # NEW: keep only BikePoint-like IDs (until you build a crosswalk)
+            if max_station_id is not None:
+                tmp = tmp[tmp["station_id"] <= max_station_id]
+
             tmp["station_id"] = tmp["station_id"].astype("int32")
             tmp["ts"] = tmp["ts"].dt.floor(freq)
             g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_start"})
@@ -357,6 +381,11 @@ def aggregate_one_file_to_parquet(
             tmp["station_id"] = pd.to_numeric(tmp[end_id], errors="coerce")
             tmp["ts"] = pd.to_datetime(tmp[end_dt], dayfirst=dayfirst, errors="coerce")
             tmp = tmp.dropna(subset=["station_id", "ts"])
+
+            # NEW
+            if max_station_id is not None:
+                tmp = tmp[tmp["station_id"] <= max_station_id]
+
             tmp["station_id"] = tmp["station_id"].astype("int32")
             tmp["ts"] = tmp["ts"].dt.floor(freq)
             g = tmp.groupby(["station_id", "ts"], as_index=False).size().rename(columns={"size": "trips_end"})
