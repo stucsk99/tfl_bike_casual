@@ -30,6 +30,7 @@ from typing import List, Optional, Tuple, Set
 import pandas as pd
 import polars as pl
 import requests
+import random
 
 
 # -----------------------------
@@ -183,7 +184,9 @@ def load_or_fetch_weather_for_cell(
     )
     w = fetch_open_meteo_hourly_with_retry(req)
     w["weather_cell_id"] = cell_id
-    w.to_parquet(cache_path, index=False)
+    tmp_path = cache_path + ".tmp"
+    w.to_parquet(tmp_path, index=False)
+    os.replace(tmp_path, cache_path)
 
     time.sleep(polite_sleep_s)
     return w
