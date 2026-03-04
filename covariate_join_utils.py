@@ -318,10 +318,9 @@ def build_bike_panel_with_covariates_from_panel(
     cells = station_map[["weather_cell_id", "cell_lat", "cell_lon"]].drop_duplicates()
 
     # ---- Weather per cell (cached)
-    weather_parts = []
     for _, r in cells.iterrows():
         cid = str(r["weather_cell_id"])
-        w = load_or_fetch_weather_for_cell(
+        _ = load_or_fetch_weather_for_cell(
             cell_id=cid,
             cell_lat=float(r["cell_lat"]),
             cell_lon=float(r["cell_lon"]),
@@ -332,10 +331,6 @@ def build_bike_panel_with_covariates_from_panel(
             hourly_vars=hourly_vars,
             polite_sleep_s=polite_sleep_s,
         )
-        weather_parts.append(w)
-
-    weather = pd.concat(weather_parts, ignore_index=True)
-    weather["trips_start"] = pd.to_datetime(weather["trips_start"])
 
     # ---- Bank holidays
     bank_holidays = fetch_uk_bank_holidays()
@@ -356,7 +351,13 @@ def build_bike_panel_with_covariates_from_panel(
     # ---- Convert lookup tables to Polars
     station_map_pl = pl.from_pandas(station_map[["station_id", "weather_cell_id"]])
 
-    weather_pl = pl.from_pandas(weather).with_columns(pl.col("trips_start").cast(pl.Datetime))
+    #weather_pl = pl.from_pandas(weather).with_columns(pl.col("trips_start").cast(pl.Datetime))
+
+    weather_lf = (
+            pl.scan_parquet(os.path.join(cache_dir, f"weather_*_{start_date}_{end_date}.parquet"))
+            .with_columns(pl.col("trips_start").cast(pl.Datetime))
+            .unique(subset=["weather_cell_id", "trips_start"])
+        )
 
     if include_daylight and daylight_daily is not None:
         daylight_pl = pl.from_pandas(daylight_daily).with_columns([
@@ -365,10 +366,17 @@ def build_bike_panel_with_covariates_from_panel(
         ])
 
     # ---- Join weather_cell_id onto the big panel by station_id (no lat/lon join!)
-    df = bike.join(station_map_pl.lazy(), on="station_id", how="left")
+    df = bike.join(station_map_pl.lazy(), on="station_id", how="left",  validate="m:1")
 
     # ---- Join weather on (weather_cell_id, trips_start)
-    df = df.join(weather_pl.lazy(), on=["weather_cell_id", "trips_start"], how="left")
+    #df = df.join(weather_pl.lazy(), on=["weather_cell_id", "trips_start"], how="left")
+
+    df = df.join(
+    weather_lf,
+    on=["weather_cell_id", "trips_start"],
+    how="left",
+    validate="m:1"
+    )
 
     # ---- Calendar features
     df = df.with_columns([
@@ -401,28 +409,37 @@ def build_bike_panel_with_covariates_from_panel(
         ])
 
     # ---- Select output columns (keep existing lat/lon/station_name from the panel)
+    # IMPORTANT: adjust these to YOUR column meanings
+# In your data: ts = timestamp, trips_start = trip count
+# If you've renamed columns earlier to standardize, then keep the old names.
     base_cols = [
-        "station_id", "trips_start", "date", "ts", "y_log1p", "strike_exposed",
-        "lat", "lon",
-        "station_name",  # keep if present
-        "weather_cell_id",
-        "hour", "dow", "month", "year", "doy",
-        "is_weekend", "is_am_peak", "is_pm_peak", "hour_dow",
-        "is_bank_holiday",
-        *hourly_vars,
+    "station_id",
+    "trips_start",          # ✅ timestamp (after your rename)
+    "date",
+    "ts",                   # ✅ outcome count (after your rename)
+    "y_log1p",
+    "strike_exposed",
+    "lat", "lon",
+    "station_name",
+    "weather_cell_id",
+    "hour", "dow", "month", "year", "doy",
+    "is_weekend", "is_am_peak", "is_pm_peak",
+    "is_bank_holiday",
+    *hourly_vars,
     ]
     if include_daylight:
         base_cols += ["sunrise", "sunset", "is_daylight"]
 
-    existing = set(df.schema.keys())
-    select_cols = [c for c in base_cols if c in existing]
-
-    out = df.select(select_cols).collect(streaming=streaming_collect)
+    df_out = df.select(base_cols)
 
     if out_path is not None:
-        out.write_parquet(out_path)
+        # STREAM to disk; do NOT collect into RAM
+        df_out.sink_parquet(out_path, compression="zstd")
+        # Return a small sample so the notebook stays responsive
+        return None
 
-    return out
+    # If no out_path, don't return the full 7M rows by accident
+    return df_out.limit(100_000).collect()
 
 
 # -----------------------------
