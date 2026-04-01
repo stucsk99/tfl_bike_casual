@@ -115,7 +115,7 @@ def fetch_open_meteo_hourly_with_retry(req, max_retries=8, base_sleep=2.0, jitte
         "hourly": ",".join(req.hourly_vars),
     }
 
-    last_err = None
+    last_err = RuntimeError("All retries exhausted (unknown error)")
     for attempt in range(max_retries + 1):
         try:
             r = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=90)
@@ -132,6 +132,7 @@ def fetch_open_meteo_hourly_with_retry(req, max_retries=8, base_sleep=2.0, jitte
                 # add jitter
                 sleep_s *= (1.0 + random.uniform(0, jitter))
                 time.sleep(sleep_s)
+                last_err = RuntimeError(f"Rate limited (429) after {attempt} retries")
                 continue
 
             r.raise_for_status()
