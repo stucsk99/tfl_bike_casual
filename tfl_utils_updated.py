@@ -242,10 +242,6 @@ def combine_parquet_parts(parts_dir: str | Path) -> pd.DataFrame:
     Concatenate per-file parquets from aggregate_folder_to_parquet and sum
     trip counts for any duplicate station-time rows (which can arise when
     multiple files cover overlapping date ranges).
-    
-    NOTE: The internal aggregation creates columns (ts=datetime, trips_start=count)
-    but downstream code expects the opposite (ts=count, trips_start=datetime).
-    We rename here to match downstream expectations.
     """
     parts = sorted(Path(parts_dir).glob("*.parquet"))
     if not parts:
@@ -258,18 +254,8 @@ def combine_parquet_parts(parts_dir: str | Path) -> pd.DataFrame:
         sum_cols = [c for c in ["trips_start", "trips_end"] if c in acc.columns]
         acc = acc.groupby(["station_id", "ts"], as_index=False)[sum_cols].sum()
 
-    result = acc.sort_values(["station_id", "ts"]).reset_index(drop=True)
-    
-    # Rename to match downstream expectations: ts→trips_start (datetime), trips_start→ts (count)
-    result = result.rename(columns={
-        "ts": "trips_start",           # ts (datetime) → trips_start
-        "trips_start": "ts",           # trips_start (count) → ts
-    })
-    if "trips_end" in result.columns:
-        # If trips_end exists, we don't rename it (it stays as a count column)
-        pass
-    
-    return result
+    acc = acc.rename(columns={'ts': 'trips_start', 'trips_start': 'ts'})
+    return acc.sort_values(["station_id", "trips_start"]).reset_index(drop=True)
 
 
 # ── 2. Bike station locations ─────────────────────────────────────────────────
@@ -298,47 +284,66 @@ def load_bike_station_locations(bikepoints_json_path: str | Path) -> pd.DataFram
     }).dropna(subset=["lat", "lon"]).reset_index(drop=True)
 
 
-# ── 3. Tube stations + lines ──────────────────────────────────────────────────
+# ── 3. Tube stations from FOI CSV ─────────────────────────────────────────────
 
-def fetch_tube_stations_and_lines(*, timeout: int = 60) -> tuple[pd.DataFrame, pd.DataFrame]:
+# Mapping from the display names in the FOI LINES column to the affected_line
+# format used in the strikes CSV (e.g. "central_line", "hammersmith-city_line").
+# Only Underground lines are included — DLR, Overground, etc. are excluded.
+_FOI_LINE_NAME_MAP: dict[str, str] = {
+    "bakerloo":          "bakerloo_line",
+    "central":           "central_line",
+    "circle":            "circle_line",
+    "district":          "district_line",
+    "hammersmith & city":"hammersmith-city_line",
+    "hammersmith and city":"hammersmith-city_line",
+    "jubilee":           "jubilee_line",
+    "metropolitan":      "metropolitan_line",
+    "northern":          "northern_line",
+    "piccadilly":        "piccadilly_line",
+    "victoria":          "victoria_line",
+    "waterloo & city":   "waterloo-city_line",
+    "waterloo and city": "waterloo-city_line",
+}
+
+
+def load_tube_stations_foi(csv_path: str | Path) -> pd.DataFrame:
     """
-    Fetch all Underground stop points from the TfL StopPoint API.
+    Load all 271 London Underground stations from the TfL FOI CSV
+    (FOI-1451-1819, file Stations_20180921.csv).
 
-    Returns:
-        tube_stations : DataFrame with tube_station_id, tube_station_name, lat, lon
-        tube_lines    : DataFrame with tube_station_id, affected_line
-                        (e.g. 'central_line') — one row per station-line pair.
+    The CSV has columns: NAME, LINES, NETWORK, x (longitude), y (latitude).
+    This function filters to London Underground only, parses the comma-separated
+    LINES field, and returns one row per station-line pair — ready to pass
+    directly to build_station_line_map().
 
-    Only Underground lines are retained (see UNDERGROUND_LINES).
+    Returns columns: name, lat, lon, affected_line
     """
-    r = requests.get("https://api.tfl.gov.uk/StopPoint/Mode/tube", timeout=timeout)
-    r.raise_for_status()
-    stop_points = r.json().get("stopPoints", r.json())
+    df = pd.read_csv(csv_path)
+    lu = df[df["NETWORK"] == "London Underground"].copy()
 
-    station_rows, line_rows = [], []
-    for sp in stop_points:
-        sid  = sp.get("naptanId") or sp.get("id")
-        lat  = sp.get("lat")
-        lon  = sp.get("lon")
-        if not (sid and lat and lon):
-            continue
+    rows = []
+    for _, row in lu.iterrows():
+        lat  = float(row["y"])
+        lon  = float(row["x"])
+        name = str(row["NAME"]).strip()
 
-        station_rows.append({
-            "tube_station_id":   sid,
-            "tube_station_name": sp.get("commonName"),
-            "lat": lat, "lon": lon,
-        })
-        for ln in sp.get("lines", []) or []:
-            line_id = ln.get("id")
-            if line_id in UNDERGROUND_LINES:
-                line_rows.append({
-                    "tube_station_id": sid,
-                    "affected_line":   f"{line_id}_line",
+        # LINES is a comma-separated display string, e.g. "District, Circle"
+        for raw_line in str(row["LINES"]).split(","):
+            line_key     = raw_line.strip().lower()
+            affected_line = _FOI_LINE_NAME_MAP.get(line_key)
+            if affected_line is not None:
+                rows.append({
+                    "name":          name,
+                    "lat":           lat,
+                    "lon":           lon,
+                    "affected_line": affected_line,
                 })
 
-    tube_stations = pd.DataFrame(station_rows).drop_duplicates(subset=["tube_station_id"])
-    tube_lines    = pd.DataFrame(line_rows).drop_duplicates()
-    return tube_stations, tube_lines
+    result = pd.DataFrame(rows).drop_duplicates()
+    n_stations = result["name"].nunique()
+    n_pairs    = len(result)
+    print(f"Loaded {n_stations} Underground stations, {n_pairs} station-line pairs")
+    return result
 
 
 # ── 4. Spatial mapping ────────────────────────────────────────────────────────
@@ -354,60 +359,83 @@ def haversine_m(lat1, lon1, lat2, lon2) -> np.ndarray:
 
 
 def build_station_line_map(
-    bike_stations:           pd.DataFrame,
-    tube_stations:           pd.DataFrame,
-    tube_lines:              pd.DataFrame,
+    bike_stations:       pd.DataFrame,
+    tube_stations_foi:   pd.DataFrame,
     *,
-    radius_m:                float = 800.0,
-    fallback_to_nearest:     bool  = True,
+    radius_m:            float = 800.0,
+    fallback_to_nearest: bool  = True,
 ) -> pd.DataFrame:
     """
-    Build a bike station → Underground line exposure table.
+    Build a bike station → Underground line exposure table using the TfL FOI
+    station CSV (loaded via load_tube_stations_foi()).
 
-    For each bike station, we find all tube stations within radius_m and
-    look up which Underground lines they serve.  If no tube station is within
-    the radius and fallback_to_nearest=True, we map to the single nearest tube
-    station regardless of distance (ensures every bike station has at least one
-    line assignment).
+    For each bike station we find all tube stations within radius_m and record
+    which Underground lines they serve. If no tube station falls within the
+    radius and fallback_to_nearest=True, the single nearest tube station is
+    used regardless of distance — this ensures every bike station gets at least
+    one line assignment.
 
-    The radius of 800m is a defensible walking catchment: it is roughly
-    10 minutes on foot and consistent with TfL's own accessibility modelling.
+    The 800m radius is a standard walking catchment consistent with TfL's own
+    accessibility modelling (~10 minutes on foot).
 
-    Returns columns: station_id, affected_line, tube_station_id, dist_m
+    Parameters
+    ----------
+    bike_stations     : DataFrame with columns station_id, lat, lon.
+    tube_stations_foi : Output of load_tube_stations_foi() — one row per
+                        station-line pair with columns name, lat, lon, affected_line.
+    radius_m          : Search radius in metres.
+    fallback_to_nearest : If True, assign the nearest tube station when none
+                          fall within radius_m.
+
+    Returns
+    -------
+    DataFrame with columns: station_id, affected_line, tube_station_name, dist_m
+        One row per (bike station, Underground line) pair.
+        Where a line is served by multiple tube stations within radius_m,
+        only the nearest is retained.
     """
-    b_lats = bike_stations["lat"].to_numpy()
-    b_lons = bike_stations["lon"].to_numpy()
-    t_lats = tube_stations["lat"].to_numpy()
-    t_lons = tube_stations["lon"].to_numpy()
-    t_ids  = tube_stations["tube_station_id"].to_numpy()
+    b_lats  = bike_stations["lat"].to_numpy()
+    b_lons  = bike_stations["lon"].to_numpy()
+    t_lats  = tube_stations_foi["lat"].to_numpy()
+    t_lons  = tube_stations_foi["lon"].to_numpy()
+    t_names = tube_stations_foi["name"].to_numpy()
+    t_lines = tube_stations_foi["affected_line"].to_numpy()
 
     rows = []
-    for i, (bike_id, blat, blon) in enumerate(
-        zip(bike_stations["station_id"], b_lats, b_lons)
-    ):
+    for bike_id, blat, blon in zip(bike_stations["station_id"], b_lats, b_lons):
         dists = haversine_m(blat, blon, t_lats, t_lons)
         idxs  = np.where(dists <= radius_m)[0]
+
         if len(idxs) == 0 and fallback_to_nearest:
             idxs = np.array([int(np.argmin(dists))])
+
         for j in idxs:
             rows.append({
-                "station_id":      int(bike_id),
-                "tube_station_id": t_ids[j],
-                "dist_m":          float(dists[j]),
+                "station_id":        int(bike_id),
+                "tube_station_name": t_names[j],
+                "affected_line":     t_lines[j],
+                "dist_m":            float(dists[j]),
             })
 
-    station_tube = pd.DataFrame(rows).drop_duplicates()
-    station_line_map = (
-        station_tube
-        .merge(tube_lines, on="tube_station_id", how="left")
-        .dropna(subset=["affected_line"])
-        [["station_id", "affected_line", "tube_station_id", "dist_m"]]
-        # Keep the nearest tube station per (station_id, affected_line)
+    if not rows:
+        return pd.DataFrame(columns=["station_id", "tube_station_name",
+                                     "affected_line", "dist_m"])
+
+    result = (
+        pd.DataFrame(rows)
+        # Keep nearest tube station per (bike station, line) — eliminates
+        # duplicate line entries when multiple stations on the same line
+        # are within radius_m
         .sort_values(["station_id", "affected_line", "dist_m"])
         .drop_duplicates(subset=["station_id", "affected_line"], keep="first")
         .reset_index(drop=True)
     )
-    return station_line_map
+
+    n_bike    = result["station_id"].nunique()
+    n_pairs   = len(result)
+    n_lines   = result["affected_line"].nunique()
+    print(f"Station-line map: {n_bike} bike stations × {n_lines} lines = {n_pairs} pairs")
+    return result
 
 
 # ── 5. Strike expansion ───────────────────────────────────────────────────────
@@ -449,11 +477,11 @@ def attach_strikes_to_base(
     A station-hour is treated (strike_exposed = 1) if any Underground line
     serving that station is on strike on that day.
 
-    base must have columns: station_id, trips_start (datetime).
+    base must have columns: station_id, ts (datetime).
     """
-    df                = base.copy()
-    df["trips_start"] = pd.to_datetime(df["trips_start"])
-    df["date"]        = df["trips_start"].dt.floor("D")
+    df          = base.copy()
+    df["ts"]    = pd.to_datetime(df["trips_start"])
+    df["date"]  = df["ts"].dt.floor("D")
 
     station_day_treat = (
         strikes_daily
