@@ -442,26 +442,33 @@ def build_station_line_map(
 
 def expand_strikes_daily(strike_data: pd.DataFrame) -> pd.DataFrame:
     """
-    Expand strike events from a date-range table into one row per strike day.
-
-    Expected input columns:
-        date_start   (dd/mm/yy or yyyy-mm-dd)
-        date_end     (same)
-        affected_line  (e.g. 'central_line')
-
-    Returns columns: date (datetime64), affected_line, strike (=1).
+    Expand strike events into daily rows.
+    Normalises affected_line to use hyphens consistently
+    (e.g. 'hammersmith_city_line' → 'hammersmith-city_line')
+    to match the format produced by load_tube_stations_foi().
     """
     s = strike_data.copy()
-    s["date_start"] = pd.to_datetime(s["date_start"], dayfirst=True, errors="coerce")
-    s["date_end"]   = pd.to_datetime(s["date_end"],   dayfirst=True, errors="coerce")
-    s = s.dropna(subset=["date_start", "date_end", "affected_line"])
+    s["date_start"]    = pd.to_datetime(s["date_start"], dayfirst=True, errors="coerce")
+    s["date_end"]      = pd.to_datetime(s["date_end"],   dayfirst=True, errors="coerce")
+    s                  = s.dropna(subset=["date_start", "date_end", "affected_line"])
+
+    # Normalise line names: replace underscores with hyphens, lowercase, strip
+    s["affected_line"] = (
+        s["affected_line"]
+        .str.strip()
+        .str.lower()
+        .str.replace("_", "-", regex=False)
+    )
 
     rows = []
     for row in s.itertuples(index=False):
         for d in pd.date_range(row.date_start.floor("D"), row.date_end.floor("D"), freq="D"):
             rows.append({"date": d, "affected_line": row.affected_line, "strike": 1})
 
-    return pd.DataFrame(rows).drop_duplicates()
+    result = pd.DataFrame(rows).drop_duplicates()
+    print(f"Strike-day-line records: {len(result)}")
+    print(f"Lines covered: {sorted(result['affected_line'].unique())}")
+    return result
 
 
 # ── 6. Attach strike exposure ─────────────────────────────────────────────────
@@ -477,11 +484,10 @@ def attach_strikes_to_base(
     A station-hour is treated (strike_exposed = 1) if any Underground line
     serving that station is on strike on that day.
 
-    base must have columns: station_id, ts (datetime).
+    base must have columns: station_id, trips_start (datetime), ts (numeric trip count).
     """
     df          = base.copy()
-    df["ts"]    = pd.to_datetime(df["trips_start"])
-    df["date"]  = df["ts"].dt.floor("D")
+    df["date"]  = pd.to_datetime(df["trips_start"]).dt.floor("D")
 
     station_day_treat = (
         strikes_daily
